@@ -303,18 +303,27 @@ def cmd_logs(args: argparse.Namespace) -> int:
             continue
 
         if since and since_dt:
+            # Strip timezone from since_dt for naive-log comparison
+            since_naive = since_dt.replace(tzinfo=None) if since_dt.tzinfo else since_dt
             for line in lines:
-                # Log lines start with [ISO8601], e.g. [2026-06-04T12:00:00Z]
-                if line.startswith("[") and len(line) > 25:
-                    try:
-                        ts_str = line[1:26].rstrip("Z]")
-                        line_dt = datetime.fromisoformat(ts_str)
-                        if line_dt >= since_dt:
-                            output_lines.append(line)
-                    except (ValueError, IndexError):
-                        output_lines.append(line)
-                else:
-                    output_lines.append(line)
+                # Log lines start with [ISO8601], e.g. [2026-06-04T12:00:00]
+                if line.startswith("["):
+                    close_bracket = line.find("]", 1)
+                    if close_bracket > 1:
+                        try:
+                            ts_str = line[1:close_bracket]
+                            line_dt = datetime.fromisoformat(
+                                ts_str.rstrip("Z")
+                            )
+                            # line_dt may be aware; normalize to naive for comparison
+                            if line_dt.tzinfo:
+                                line_dt = line_dt.replace(tzinfo=None)
+                            if line_dt >= since_naive:
+                                output_lines.append(line)
+                            continue
+                        except (ValueError, IndexError):
+                            pass
+                output_lines.append(line)
         else:
             output_lines.extend(lines)
 
