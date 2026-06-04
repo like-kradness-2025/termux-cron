@@ -4,6 +4,7 @@ Handles reading/writing the tasks YAML config file,
 parsing interval strings, and validating task schemas.
 """
 
+import fcntl
 import os
 import re
 from pathlib import Path
@@ -178,6 +179,21 @@ def validate(task: dict) -> None:
 
 # ── Load / Save ──────────────────────────────────────────────────────────────
 
+_LOCK_FILE = CONFIG_DIR / "tasks.lock"
+
+
+def _acquire_lock(shared: bool = True) -> int:
+    """Acquire file lock on tasks.lock. Blocks until acquired."""
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+    return fd
+
+
+def _release_lock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
 
 def load() -> list[dict]:
     """Load tasks from the default YAML config file.
@@ -188,48 +204,52 @@ def load() -> list[dict]:
         A list of validated task dictionaries.
         Returns an empty list if the file does not exist.
     """
-    if not TASKS_PATH.exists():
-        return []
-
+    lock_fd = _acquire_lock(shared=True)
     try:
-        with open(TASKS_PATH, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
-    except (OSError, yaml.YAMLError) as exc:
-        raise ValueError(f"Failed to load tasks: {exc}") from exc
+        if not TASKS_PATH.exists():
+            return []
 
-    if data is None:
-        return []
-
-    if not isinstance(data, dict):
-        raise ValueError(
-            f"Expected a YAML mapping at the top level, got {type(data).__name__}"
-        )
-
-    tasks = data.get("tasks", [])
-    if not isinstance(tasks, list):
-        raise ValueError(
-            f"'tasks' must be a list, got {type(tasks).__name__}"
-        )
-
-    validated = []
-    seen_names: set[str] = set()
-    for i, task in enumerate(tasks):
         try:
-            validate(task)
-        except ValueError as exc:
-            raise ValueError(f"Task #{i}: {exc}") from None
-        name = task["name"]
-        if name in seen_names:
-            raise ValueError(
-                f"Task #{i}: duplicate task name {name!r}. Task names must be unique."
-            )
-        seen_names.add(name)
-        # Fill in default for enabled if not present
-        if "enabled" not in task:
-            task["enabled"] = True
-        validated.append(task)
+            with open(TASKS_PATH, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh)
+        except (OSError, yaml.YAMLError) as exc:
+            raise ValueError(f"Failed to load tasks: {exc}") from exc
 
-    return validated
+        if data is None:
+            return []
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Expected a YAML mapping at the top level, got {type(data).__name__}"
+            )
+
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            raise ValueError(
+                f"'tasks' must be a list, got {type(tasks).__name__}"
+            )
+
+        validated = []
+        seen_names: set[str] = set()
+        for i, task in enumerate(tasks):
+            try:
+                validate(task)
+            except ValueError as exc:
+                raise ValueError(f"Task #{i}: {exc}") from None
+            name = task["name"]
+            if name in seen_names:
+                raise ValueError(
+                    f"Task #{i}: duplicate task name {name!r}. Task names must be unique."
+                )
+            seen_names.add(name)
+            # Fill in default for enabled if not present
+            if "enabled" not in task:
+                task["enabled"] = True
+            validated.append(task)
+
+        return validated
+    finally:
+        _release_lock(lock_fd)
 
 
 def save(tasks: list[dict]) -> None:
@@ -259,22 +279,26 @@ def save(tasks: list[dict]) -> None:
             )
         seen_names.add(name)
 
-    data = {"tasks": tasks}
-    tmp = TASKS_PATH.with_suffix(".yaml.tmp")
+    lock_fd = _acquire_lock(shared=False)
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            yaml.dump(data, fh, default_flow_style=False, allow_unicode=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, TASKS_PATH)
-        # fsync the directory so the rename is durable
-        dir_fd = os.open(str(CONFIG_DIR), os.O_RDONLY)
+        data = {"tasks": tasks}
+        tmp = TASKS_PATH.with_suffix(".yaml.tmp")
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except (OSError, yaml.YAMLError) as exc:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
-        raise ValueError(f"Failed to save tasks: {exc}") from exc
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                yaml.dump(data, fh, default_flow_style=False, allow_unicode=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, TASKS_PATH)
+            # fsync the directory so the rename is durable
+            dir_fd = os.open(str(CONFIG_DIR), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, yaml.YAMLError) as exc:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+            raise ValueError(f"Failed to save tasks: {exc}") from exc
+    finally:
+        _release_lock(lock_fd)

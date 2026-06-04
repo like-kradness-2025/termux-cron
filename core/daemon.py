@@ -337,7 +337,11 @@ def run_daemon(
         logger.warning("No tasks configured. Daemon will idle indefinitely.")
 
     scheduler = TaskScheduler(tasks)
-    storage = Storage()
+    try:
+        storage = Storage()
+    except Exception as exc:
+        logger.error("Failed to initialize storage: %s", exc)
+        return
 
     logger.info("Loaded %d task(s): %s", len(scheduler), ", ".join(scheduler.task_names))
 

@@ -68,7 +68,7 @@ class Storage:
         duration_ms: int | None = None,
         output: str | None = None,
         webhook_ok: int | None = None,
-    ) -> int:
+    ) -> int | None:
         """Insert a new run record and return its row id.
 
         Args:
@@ -84,21 +84,28 @@ class Storage:
             The primary key (row id) of the newly inserted record.
         """
         conn = self._conn
-        cursor = conn.execute(
-            """
-            INSERT INTO runs (task_name, started_at, finished_at,
-                              exit_code, duration_ms, output, webhook_ok)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_name, started_at, finished_at,
-             exit_code, duration_ms, output, webhook_ok),
-        )
-        conn.commit()
-        row_id = cursor.lastrowid
-        # lastrowid is always set after a successful INSERT on an
-        # AUTOINCREMENT table, but Pyright can't narrow it, so we assert.
-        assert row_id is not None
-        return row_id
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO runs (task_name, started_at, finished_at,
+                                  exit_code, duration_ms, output, webhook_ok)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_name, started_at, finished_at,
+                 exit_code, duration_ms, output, webhook_ok),
+            )
+            conn.commit()
+            row_id = cursor.lastrowid
+            # lastrowid is always set after a successful INSERT on an
+            # AUTOINCREMENT table, but Pyright can't narrow it, so we assert.
+            assert row_id is not None
+            return row_id
+        except sqlite3.Error as exc:
+            import logging
+            logging.getLogger(__name__).error(
+                "Failed to record run for %s: %s", task_name, exc
+            )
+            return None
 
     def get_history(self, task_name: str, limit: int = 20) -> list[dict]:
         """Return the most recent runs for a given task.
