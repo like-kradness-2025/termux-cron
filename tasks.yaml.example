@@ -1,0 +1,26 @@
+# tasks.yaml.example — termux-cron task definitions
+#
+# Copy this file to ~/.config/termux-cron/tasks.yaml and edit.
+
+tasks:
+  - name: system-monitor
+    cmd: python3 /home/termux/termux-cron/collector.py
+    every: 1s
+    enabled: true
+
+  - name: render-dashboard
+    cmd: python3 /home/termux/termux-cron/dashboard/render.py
+    every: 1m
+    enabled: true
+    webhook: https://discord.com/api/webhooks/your-webhook-url
+
+  - name: backup-logs
+    cmd: tar czf /sdcard/backup/logs.tar.gz logs/
+    every: 6h
+    enabled: false
+
+  - name: disk-check
+    cmd: df -h /
+    every: 1h
+    enabled: true
+    timeout: 10s
