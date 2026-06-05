@@ -55,7 +55,10 @@ def post_webhook(url: str, payload: dict) -> bool:
             url,
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "termux-cron/1.0",
+            },
         )
 
         with urllib_request.urlopen(req, timeout=_WEBHOOK_TIMEOUT) as resp:
