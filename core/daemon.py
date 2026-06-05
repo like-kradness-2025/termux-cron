@@ -262,7 +262,7 @@ def _execute_task(
             f"```\n{output_preview}\n```\n"
             f"exit={exit_code}  duration={duration_str}"
         )
-        payload = {"content": content, "username": "termux-cron"}
+        payload = {"content": content, "username": "termux-cron", "flags": 4096}
         try:
             ok = post_webhook(webhook_url, payload)
             webhook_ok = 1 if ok else 0
