@@ -253,14 +253,16 @@ def _execute_task(
     webhook_ok = None
     webhook_url = task.get("webhook")
     if webhook_url:
-        payload = {
-            "task": task_name,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "exit_code": exit_code,
-            "duration_ms": duration_ms,
-            "output": output,
-        }
+        # Format for Discord webhook
+        status_icon = "✅" if exit_code == 0 else "❌"
+        duration_str = f"{duration_ms}ms" if duration_ms else "N/A"
+        output_preview = (output[:500] + "...") if output and len(output) > 500 else (output or "N/A")
+        content = (
+            f"{status_icon} **{task_name}**\n"
+            f"```\n{output_preview}\n```\n"
+            f"exit={exit_code}  duration={duration_str}"
+        )
+        payload = {"content": content, "username": "termux-cron"}
         try:
             ok = post_webhook(webhook_url, payload)
             webhook_ok = 1 if ok else 0
