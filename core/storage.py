@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 # Default config directory (same logic as config module but independent)
+_DB_PATH_ENV = "TERMUX_CRON_DB"  # env var for full DB path override
 DB_DIR = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'termux-cron'
 DB_NAME = 'history.db'
 

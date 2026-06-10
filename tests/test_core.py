@@ -19,6 +19,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from core.config import parse_interval, validate, _TASK_NAME_RE
+from core.logwriter import BufferedLogWriter
 from core.runner import run_command, MAX_OUTPUT_BYTES
 from core.scheduler import TaskScheduler
 from core.storage import Storage
@@ -280,6 +281,109 @@ class TestScheduler(unittest.TestCase):
     def test_len_excludes_disabled(self):
         sched = TaskScheduler(self._make_tasks(), now=1000.0)
         self.assertEqual(len(sched), 2)
+
+
+# ── BufferedLogWriter ────────────────────────────────────────────────────────
+
+class TestBufferedLogWriter(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self.base_dir = Path(self._tmpdir)
+        self.writer = BufferedLogWriter(
+            self.base_dir,
+            buffer_bytes=64,       # small threshold to trigger flush easily
+            flush_interval=0.1,    # short timer for tests
+        )
+
+    def tearDown(self):
+        self.writer.close()
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_write_and_flush(self):
+        """Write some text, flush, and verify it appears on disk."""
+        self.writer.write("task1", "hello world")
+        self.writer.flush()
+
+        # Find the log file
+        log_files = sorted(self.base_dir.rglob("*.log"))
+        self.assertGreater(len(log_files), 0)
+
+        content = log_files[0].read_text()
+        self.assertIn("hello world", content)
+        self.assertIn("[2026", content)  # timestamp bracket
+
+    def test_auto_flush_on_buffer_threshold(self):
+        """Default-buffer-flush: write enough to exceed buffer_bytes."""
+        # Write a string larger than buffer_bytes (64)
+        big_line = "x" * 100
+        self.writer.write("task2", big_line)
+        # No explicit flush — should auto-flush because buffer exceeded
+
+        log_files = sorted(self.base_dir.rglob("*.log"))
+        self.assertGreater(len(log_files), 0)
+
+        content = log_files[0].read_text()
+        self.assertIn("x" * 100, content)
+
+    def test_multiple_tasks_separate_files(self):
+        """Two task names produce separate log directories/files."""
+        self.writer.write("alpha", "data_a")
+        self.writer.write("beta", "data_b")
+        self.writer.flush()
+
+        alpha_files = sorted(self.base_dir.rglob("alpha/*.log"))
+        beta_files = sorted(self.base_dir.rglob("beta/*.log"))
+
+        self.assertEqual(len(alpha_files), 1)
+        self.assertEqual(len(beta_files), 1)
+
+        self.assertIn("data_a", alpha_files[0].read_text())
+        self.assertIn("data_b", beta_files[0].read_text())
+
+    def test_write_closed_writer(self):
+        """After close(), writes are silently dropped (no crash)."""
+        self.writer.close()
+        # Should not raise
+        self.writer.write("task3", "ghost data")
+        self.writer.flush()
+
+        # No files should exist
+        log_files = sorted(self.base_dir.rglob("*.log"))
+        self.assertEqual(len(log_files), 0)
+
+    def test_close_flushes_pending(self):
+        """close() flushes pending data before closing handles."""
+        self.writer.write("task4", "must survive close")
+        self.writer.close()
+
+        log_files = sorted(self.base_dir.rglob("*.log"))
+        self.assertGreater(len(log_files), 0)
+        self.assertIn("must survive close", log_files[0].read_text())
+
+    def test_double_close(self):
+        """Calling close() twice is a no-op."""
+        self.writer.write("task5", "hello")
+        self.writer.close()
+        self.writer.close()  # should not raise
+        self.assertTrue(self.writer.is_closed)
+
+    def test_context_manager(self):
+        """Writer works as a context manager."""
+        with BufferedLogWriter(self.base_dir) as w:
+            w.write("ctx", "context manager")
+        # After __exit__, data should be flushed and handles closed
+        log_files = sorted(self.base_dir.rglob("ctx/*.log"))
+        self.assertEqual(len(log_files), 1)
+        self.assertIn("context manager", log_files[0].read_text())
+        self.assertTrue(w.is_closed)
+
+    def test_empty_write_noop(self):
+        """Writing empty string creates no file."""
+        self.writer.write("empty", "")
+        self.writer.flush()
+        log_files = sorted(self.base_dir.rglob("*.log"))
+        self.assertEqual(len(log_files), 0)
 
 
 if __name__ == "__main__":

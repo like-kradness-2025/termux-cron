@@ -1,14 +1,21 @@
-"""Daemon module for termux-cron.
+"""
+Daemon module for termux-cron.
 
-Main event loop that orchestrates scheduler, runner, storage, and webhook
-modules. Handles graceful shutdown on SIGTERM/SIGINT and log rotation cleanup.
+Main event loop that orchestrates scheduler, runner, storage, webhook,
+and the buffered log writer.  Handles graceful shutdown on SIGTERM/SIGINT.
 
-Tasks are executed **sequentially** (one at a time) per the SPEC.
+Optimised for Android/Termux:
+    - Buffered log writes (avoid open→write→close per task run on F2FS)
+    - Optional ``termux-wake-lock`` acquisition on startup
+    - Optional memory-pressure check before executing tasks
+    - Config file change detection (auto-reload tasks)
 """
 
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -16,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from core.config import load, parse_interval
+from core.logwriter import BufferedLogWriter
 from core.runner import run_command
 from core.scheduler import TaskScheduler
 from core.storage import Storage
@@ -23,30 +31,35 @@ from core.webhook import post_webhook
 
 logger = logging.getLogger(__name__)
 
-#: Default log retention period in days.
+# ── Tunables ─────────────────────────────────────────────────────────────────
+
 LOG_RETENTION_DAYS: int = 7
+"""Default log retention period in days."""
 
-#: Base directory for log files (can be overridden via TERMUX_CRON_LOGS env var).
 LOGS_DIR: Path = Path(os.environ.get("TERMUX_CRON_LOGS", Path.cwd() / "logs"))
+"""Base directory for log files (override via TERMUX_CRON_LOGS env var)."""
 
-#: How often (seconds) to check for config file changes and reload tasks.
 CONFIG_RELOAD_INTERVAL: float = 5.0
+"""Seconds between config-file mtime checks for auto-reload."""
 
-#: How often (seconds) to run periodic log cleanup.
-LOG_CLEANUP_INTERVAL: float = 3600.0  # 1 hour
+LOG_CLEANUP_INTERVAL: float = 3600.0
+"""Seconds between periodic old-log cleanup passes (1 hour)."""
 
-#: How often (ticks) to call cleanup_old_outputs on the storage DB.
-CLEANUP_OUTPUTS_INTERVAL_TICKS: int = 3600  # ~1 hour at 1s tick
+CLEANUP_OUTPUTS_INTERVAL_TICKS: int = 3600
+"""Tick-interval between DB output cleanup passes (~1 hour at 1s tick)."""
+
+MEMORY_WARN_MB: int = 1024
+"""Warn if MemAvailable drops below this many MB (0 = disabled)."""
 
 
 # ── Signal handling ──────────────────────────────────────────────────────────
 
 
 class GracefulShutdown:
-    """Context manager for graceful shutdown on SIGTERM/SIGINT.
+    """Context manager that installs SIGTERM/SIGINT handlers.
 
-    Sets a flag when a termination signal is received, allowing the main
-    loop to exit cleanly after completing the current tick.
+    Sets ``shutdown_requested = True`` when a termination signal is
+    received so the main loop can exit cleanly.
     """
 
     def __init__(self) -> None:
@@ -55,45 +68,106 @@ class GracefulShutdown:
         self._original_sigint = None
 
     def _handler(self, signum: int, frame: Any) -> None:
-        """Signal handler that sets the shutdown flag."""
         sig_name = signal.Signals(signum).name
         logger.info("Received %s, initiating graceful shutdown...", sig_name)
         self.shutdown_requested = True
 
     def __enter__(self) -> "GracefulShutdown":
-        """Install signal handlers."""
         self._original_sigterm = signal.signal(signal.SIGTERM, self._handler)
         self._original_sigint = signal.signal(signal.SIGINT, self._handler)
         return self
 
     def __exit__(self, *exc_info: Any) -> None:
-        """Restore original signal handlers."""
         if self._original_sigterm is not None:
             signal.signal(signal.SIGTERM, self._original_sigterm)
         if self._original_sigint is not None:
             signal.signal(signal.SIGINT, self._original_sigint)
 
 
-# ── Log management ───────────────────────────────────────────────────────────
+# ── Termux integration ──────────────────────────────────────────────────────
+
+
+def _termux_wake_lock() -> str | None:
+    """Acquire a Termux wake-lock, returning the lock name on success.
+
+    Returns ``None`` if ``termux-wake-lock`` is not available or fails.
+    This prevents the Android device from entering deep sleep (Doze)
+    while the daemon is running.
+    """
+    if not shutil.which("termux-wake-lock"):
+        logger.info("termux-wake-lock not found — skipping wake-lock acquisition")
+        return None
+
+    lock_name = "termux-cron"
+    try:
+        subprocess.run(
+            ["termux-wake-lock", lock_name],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        logger.info("Acquired wake-lock: %s", lock_name)
+        return lock_name
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        logger.warning("Failed to acquire wake-lock: %s", exc)
+        return None
+
+
+def _termux_wake_unlock(lock_name: str | None) -> None:
+    """Release a previously acquired Termux wake-lock."""
+    if lock_name is None:
+        return
+    try:
+        subprocess.run(
+            ["termux-wake-unlock", lock_name],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        logger.info("Released wake-lock: %s", lock_name)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        logger.warning("Failed to release wake-lock: %s", exc)
+
+
+# ── Memory pressure check (Android-safe) ─────────────────────────────────────
+
+
+def _check_memory() -> str | None:
+    """Return a warning string if MemAvailable is below threshold, else None.
+
+    Reads ``/proc/meminfo`` — accessible from Termux on most Android
+    versions.  If the file cannot be read (permission denied), returns
+    ``None`` so execution is not blocked.
+    """
+    if MEMORY_WARN_MB <= 0:
+        return None
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        avail_kb = int(parts[1])
+                        avail_mb = avail_kb // 1024
+                        if avail_mb < MEMORY_WARN_MB:
+                            return (
+                                f"Low memory: MemAvailable={avail_mb} MB "
+                                f"(threshold={MEMORY_WARN_MB} MB)"
+                            )
+                        return None
+    except (PermissionError, FileNotFoundError, OSError, ValueError):
+        # /proc/meminfo blocked or unreadable — skip check
+        pass
+    return None
+
+
+# ── Log management (retention) ───────────────────────────────────────────────
 
 
 def cleanup_old_logs(logs_dir: Path, retention_days: int = LOG_RETENTION_DAYS) -> int:
-    """Remove log files older than *retention_days*.
+    """Remove ``.log`` files older than *retention_days* from *logs_dir*.
 
-    Scans the logs directory recursively for .log files and deletes those
-    whose modification time is older than the retention threshold.
-
-    Parameters
-    ----------
-    logs_dir : Path
-        Base directory containing task log subdirectories.
-    retention_days : int
-        Number of days to retain log files (default 7).
-
-    Returns
-    -------
-    int
-        Number of files deleted.
+    Returns the number of files deleted.
     """
     if not logs_dir.exists():
         return 0
@@ -113,65 +187,18 @@ def cleanup_old_logs(logs_dir: Path, retention_days: int = LOG_RETENTION_DAYS) -
             logger.warning("Failed to delete %s: %s", log_file, exc)
 
     if deleted > 0:
-        logger.info("Cleaned up %d old log file(s) (older than %d days)", deleted, retention_days)
-
+        logger.info(
+            "Cleaned up %d old log file(s) (older than %d days)",
+            deleted, retention_days,
+        )
     return deleted
 
 
-def get_log_path(task_name: str, logs_dir: Path = LOGS_DIR) -> Path:
-    """Return the log file path for a task on the current date.
-
-    Parameters
-    ----------
-    task_name : str
-        Name of the task.
-    logs_dir : Path
-        Base logs directory (default: ./logs).
-
-    Returns
-    -------
-    Path
-        Path to the log file (e.g., logs/my-task/2026-06-04.log).
-    """
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    task_dir = logs_dir / task_name
-    task_dir.mkdir(parents=True, exist_ok=True)
-    return task_dir / f"{date_str}.log"
-
-
-def append_to_log(task_name: str, output: str, logs_dir: Path = LOGS_DIR) -> None:
-    """Append task output to its daily log file.
-
-    Parameters
-    ----------
-    task_name : str
-        Name of the task.
-    output : str
-        Text to append (stdout + stderr from the command).
-    logs_dir : Path
-        Base logs directory (default: ./logs).
-    """
-    if not output:
-        return
-
-    log_path = get_log_path(task_name, logs_dir)
-    try:
-        with open(log_path, "a", encoding="utf-8") as fh:
-            timestamp = datetime.now().isoformat(timespec="seconds")
-            fh.write(f"[{timestamp}]\n{output}\n")
-    except OSError as exc:
-        logger.error("Failed to write log for %s: %s", task_name, exc)
-
-
-def _purge_old_logs(logs_dir: Path = LOGS_DIR) -> None:
-    """Purge log files older than LOG_RETENTION_DAYS."""
-    deleted = cleanup_old_logs(logs_dir, LOG_RETENTION_DAYS)
-    if deleted > 0:
-        logger.info("Log cleanup: removed %d old log file(s)", deleted)
+# ── Config reload ────────────────────────────────────────────────────────────
 
 
 def _get_config_mtime() -> float:
-    """Return the mtime of the tasks config file, or 0 if not found."""
+    """Return mtime of the tasks config, or 0 if not found."""
     from core.config import TASKS_PATH
     try:
         return TASKS_PATH.stat().st_mtime
@@ -180,11 +207,7 @@ def _get_config_mtime() -> float:
 
 
 def _reload_scheduler(scheduler: TaskScheduler) -> TaskScheduler:
-    """Reload tasks from config and return a new scheduler.
-
-    Preserves next_run timestamps for tasks that still exist so we
-    don't re-fire them immediately after a reload.
-    """
+    """Reload tasks from config; preserve existing task next-run timestamps."""
     try:
         tasks = load()
     except ValueError as exc:
@@ -206,13 +229,17 @@ def _reload_scheduler(scheduler: TaskScheduler) -> TaskScheduler:
     return new_scheduler
 
 
+# ── Task execution ───────────────────────────────────────────────────────────
+
+
 def _execute_task(
     task_name: str,
     task: dict,
     logs_dir: Path,
     storage: Storage,
+    log_writer: BufferedLogWriter,
 ) -> None:
-    """Execute a single task synchronously: run command, log, record, webhook."""
+    """Execute a single task: run command → log → webhook → DB record."""
     started_at = datetime.now().isoformat(timespec="seconds")
     logger.info("Running task: %s", task_name)
 
@@ -234,7 +261,16 @@ def _execute_task(
             exit_code,
             duration_ms,
         )
-
+    except subprocess.TimeoutExpired:
+        finished_at = datetime.now().isoformat(timespec="seconds")
+        exit_code = -1
+        output = f"Task timed out (timeout={timeout_str})"
+        try:
+            _started = datetime.fromisoformat(started_at)
+            duration_ms = max(1, int((datetime.now() - _started).total_seconds() * 1000))
+        except Exception:
+            duration_ms = 0
+        logger.error("Task %s timed out (%s)", task_name, timeout_str)
     except Exception as exc:
         finished_at = datetime.now().isoformat(timespec="seconds")
         exit_code = -1
@@ -246,17 +282,19 @@ def _execute_task(
             duration_ms = 0
         logger.error("Task %s failed: %s", task_name, exc)
 
-    # ── Write to log file ───────────────────────────────────────────────
-    append_to_log(task_name, output, logs_dir)
+    # ── Buffered log write ──────────────────────────────────────────────
+    log_writer.write(task_name, output)
 
     # ── Webhook ─────────────────────────────────────────────────────────
     webhook_ok = None
     webhook_url = task.get("webhook")
     if webhook_url:
-        # Format for Discord webhook
         status_icon = "✅" if exit_code == 0 else "❌"
         duration_str = f"{duration_ms}ms" if duration_ms else "N/A"
-        output_preview = (output[:500] + "...") if output and len(output) > 500 else (output or "N/A")
+        output_preview = (
+            (output[:500] + "...") if output and len(output) > 500
+            else (output or "N/A")
+        )
         content = (
             f"{status_icon} **{task_name}**\n"
             f"```\n{output_preview}\n```\n"
@@ -295,24 +333,10 @@ def run_daemon(
 ) -> None:
     """Run the termux-cron daemon main loop.
 
-    Loads tasks from config, initialises the scheduler and storage backend,
-    then enters a single-threaded loop that checks for due tasks, executes
-    them one at a time (sequentially), records results, and sends webhooks.
-
-    The config file is monitored for changes and tasks are reloaded
-    automatically (so CLI add/remove/enable/disable take effect while the
-    daemon is running).
-
-    Old logs are cleaned up on startup and periodically (hourly).
-    Old DB outputs are also cleaned up periodically via
-    ``Storage.cleanup_old_outputs``.
-
-    Exits gracefully on SIGTERM/SIGINT.
-
     Parameters
     ----------
     logs_dir : Path
-        Base directory for task logs (default: ./logs).
+        Base directory for task logs (default: ``./logs``).
     tick_interval : float
         Seconds to sleep between ticks (default: 1.0).
     """
@@ -325,14 +349,21 @@ def run_daemon(
 
     logger.info("termux-cron daemon starting...")
 
+    # ── Termux wake-lock ────────────────────────────────────────────────
+    wake_lock_name = _termux_wake_lock()
+
     # ── Cleanup old logs on startup ───────────────────────────────────────
-    _purge_old_logs(logs_dir)
+    cleanup_old_logs(logs_dir)
+
+    # ── Buffered log writer ─────────────────────────────────────────────
+    log_writer = BufferedLogWriter(logs_dir)
 
     # ── Load tasks and initialise components ─────────────────────────────
     try:
         tasks = load()
     except ValueError as exc:
         logger.error("Failed to load tasks: %s", exc)
+        _termux_wake_unlock(wake_lock_name)
         sys.exit(1)
 
     if not tasks:
@@ -343,18 +374,18 @@ def run_daemon(
         storage = Storage()
     except Exception as exc:
         logger.error("Failed to initialize storage: %s", exc)
+        log_writer.close()
+        _termux_wake_unlock(wake_lock_name)
         return
 
     logger.info("Loaded %d task(s): %s", len(scheduler), ", ".join(scheduler.task_names))
 
-    # Track config file mtime for change detection
+    # ── State for periodic operations ─────────────────────────────────────
     last_config_mtime = _get_config_mtime()
     last_config_check = time.monotonic()
-
-    # Track last log cleanup time for periodic cleanup
     last_log_cleanup = time.monotonic()
-
-    # Tick counter for periodic cleanup_old_outputs
+    last_memory_check = time.monotonic()
+    MEMORY_CHECK_INTERVAL: float = 60.0  # check memory every 60s
     tick_count = 0
 
     # ── Graceful shutdown context ─────────────────────────────────────────
@@ -376,8 +407,15 @@ def run_daemon(
 
                 # ── Periodic log cleanup ────────────────────────────────
                 if tick_start - last_log_cleanup >= LOG_CLEANUP_INTERVAL:
-                    _purge_old_logs(logs_dir)
+                    cleanup_old_logs(logs_dir)
                     last_log_cleanup = tick_start
+
+                # ── Periodic memory check ───────────────────────────────
+                if tick_start - last_memory_check >= MEMORY_CHECK_INTERVAL:
+                    mem_warn = _check_memory()
+                    if mem_warn:
+                        logger.warning("%s", mem_warn)
+                    last_memory_check = tick_start
 
                 # ── Periodic DB output cleanup ──────────────────────────
                 if tick_count >= CLEANUP_OUTPUTS_INTERVAL_TICKS:
@@ -404,11 +442,12 @@ def run_daemon(
                     if not scheduler.is_due(task_name, now=now):
                         continue
 
-                    # Execute synchronously — one task at a time
-                    _execute_task(task_name, task, logs_dir, storage)
+                    _execute_task(task_name, task, logs_dir, storage, log_writer)
 
-                    # Advance scheduler after successful execution
                     scheduler.mark_run(task_name, now=now)
+
+                # ── Flush buffered logs ─────────────────────────────────
+                log_writer.flush()
 
                 # ── Sleep for the tick interval ─────────────────────────
                 elapsed = time.monotonic() - tick_start
@@ -420,12 +459,13 @@ def run_daemon(
             logger.info("KeyboardInterrupt received, shutting down...")
 
         finally:
+            logger.info("Shutting down: closing log writer...")
+            log_writer.close()
             logger.info("Closing storage connection...")
             storage.close()
+            _termux_wake_unlock(wake_lock_name)
             logger.info("termux-cron daemon stopped.")
 
-
-# ── Entry point for testing ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run_daemon()
